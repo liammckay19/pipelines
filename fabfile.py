@@ -185,7 +185,7 @@ def reset():
 
 
 @parallel
-def process_ceph(manifest="manifest.tsv", base=".", checksum_only="False"):
+def process_ceph(base="."):
     """ Experimental processing from ceph or s3 storage """
     import boto3
     from botocore.config import Config
@@ -195,18 +195,30 @@ def process_ceph(manifest="manifest.tsv", base=".", checksum_only="False"):
                         config=Config(signature_version='s3'))
     fastqs = sorted([obj.key for obj in s3.Bucket("CCLE").objects.all()
                      if re.search(r"fastq|fq", obj.key)])
-    print("Found {} fastq".format(len(fastqs)))
-    print(fastqs[0:8])
 
     pairs = [(fastqs[i], fastqs[i+1]) for i in range(0, len(fastqs), 2)]
-    print("Pairs:", pairs[0:4])
+    print("Found {} samples".format(len(pairs)))
+    print(fastqs[0:4])
+    return
 
-    # DEBUG: Skip first big one and the other 2 we already did
-    pairs = pairs[3:]
+    # DEBUGGING RUN ONLY ONE
+    # pairs = [("G26182.KMS-12-BM.2.btfv9.R1.fastq.gz", "G26182.KMS-12-BM.2.btfv9.R2.fastq.gz")]
+    pairs = [("G26187.MONO-MAC-1.2.btfv9.R1.fastq.gz", "G26187.MONO-MAC-1.2.btfv9.R2.fastq.gz"),
+             ("G26243.HT-1197.2.btfv9.R1.fastq.gz", "G26243.HT-1197.2.btfv9.R2.fastq.gz")]
 
     for pair in pairs[env.hosts.index(env.host)::len(env.hosts)]:
-        print("Processing {} on {}".format(pair, env.host))
+        sample_id = pair[0].split(".")[0]
+        print("Processing {}: {} on {}".format(sample_id, pair, env.host))
+
         reset()
+
+        # Initialize methods.json
+        methods = {"user": os.environ["USER"],
+                   "treeshop_version": local(
+                      "git --work-tree={0} --git-dir {0}/.git describe --always".format(
+                          os.path.dirname(__file__)), capture=True),
+                   "sample_id": sample_id}
+        methods["start"] = datetime.datetime.utcnow().isoformat()
 
         # Copy files from s3 down to machine
         run("""
@@ -218,11 +230,11 @@ def process_ceph(manifest="manifest.tsv", base=".", checksum_only="False"):
                 s3 cp --only-show-errors s3://CCLE/{} /mnt/samples/
             """.format(pair[1]))
 
-        # Run checksum as a test
+        # Run pipelines
         with settings(warn_only=True):
             result = run("cd /mnt && make expression qc")
             if result.failed:
-                _log_error("{} Failed checksums: {}".format(pair, result))
+                _log_error("{} Failed pipeline: {}".format(pair, result))
                 continue
 
         # Unpack outputs and normalize names so we don't have sample id in them
@@ -230,10 +242,13 @@ def process_ceph(manifest="manifest.tsv", base=".", checksum_only="False"):
         with cd("/mnt/outputs/expression"):
             run("tar -xvf *.tar.gz --strip 1")
             run("rm *.tar.gz")
+            # run("rm -f *.bam")
+
+        with cd("/mnt/outputs/qc"):
             run("rm -f *.bam")
+            run("rm -f *.bai")
 
         # Copy the results back to pstore
-        sample_id = pair[0].split(".")[0]
         output = "{}/downstream/{}/secondary".format(base, sample_id)
         local("mkdir -p {}".format(output))
 
@@ -246,6 +261,10 @@ def process_ceph(manifest="manifest.tsv", base=".", checksum_only="False"):
         local("mkdir -p {}".format(dest))
         results = get("/mnt/outputs/qc/*", dest)
         print(results)
+
+        methods["end"] = datetime.datetime.utcnow().isoformat()
+        with open("{}/methods.json".format(output), "w") as f:
+            f.write(json.dumps(methods, indent=4))
 
 
 def _put_primary(sample_id, base):
